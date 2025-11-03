@@ -14,19 +14,134 @@ class Event:
     data: Dict[str, Any]
 
 class Builtin(abc.ABC):
+    def __init__(self, server):
+        self.server = server
+
+    def c2s(self, event_name):
+        def decorator(func):
+            if not hasattr(self.server, '_pending_c2s'):
+                self.server._pending_c2s = []
+            self.server._pending_c2s.append((event_name, func))
+            return func
+        return decorator
+
+    def s2c(self, event_name):
+        def decorator(func):
+            self.server.s2c_listeners[event_name] = func
+            return func
+        return decorator
+
     @abc.abstractmethod
     def register(self, server):
         pass
 
+class Attributes(dict):
+    def _add_style(self, css):
+        if 'style' not in self:
+            self['style'] = ''
+        self['style'] += css + '; '
+    
+    def mime(self, value):
+        self['type'] = value
+        return self
+    
+    def bg(self, value):
+        self._add_style(f'background: {value}')
+        return self
+    
+    def fg(self, value):
+        self._add_style(f'color: {value}')
+        return self
+    
+    def font(self, value):
+        self._add_style(f'font-family: {value}')
+        return self
+    
+    def font_size(self, value):
+        self._add_style(f'font-size: {value}px')
+        return self
+    
+    def font_weight(self, value):
+        self._add_style(f'font-weight: {value}')
+        return self
+    
+    def border(self, value):
+        self._add_style(f'border: {value["width"]} {value["style"]} {value["color"]}')
+        return self
+    
+    def padding(self, value):
+        self._add_style(f'padding: {value}px')
+        return self
+    
+    def margin(self, value):
+        self._add_style(f'margin: {value}px')
+        return self
+    
+    def corners(self, value):
+        self._add_style(f'border-radius: {value}px')
+        return self
+    
+    def shadow(self, value):
+        self._add_style(f'box-shadow: {value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}')
+        return self
+    
+    def flex(self, value):
+        if value == "center":
+            self._add_style('display: flex; justify-content: center; align-items: center')
+        else:
+            self._add_style('display: flex')
+        return self
+    
+    def fg_shadow(self, value):
+        self._add_style(f'text-shadow: {value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}')
+        return self
+    
+    def text(self, value):
+        self._add_style(f'text-align: {value}')
+        return self
+    
+    def dims(self, value):
+        self._add_style(f'width: {value["width"]}px; height: {value["height"]}px')
+        return self
+    
+    def pos(self, value):
+        self._add_style(f'position: absolute; top: {value["top"]}px; left: {value["left"]}px')
+        return self
+    
+    def custom(self, key, value):
+        if key == 'style':
+            self._add_style(value.rstrip(';'))
+        else:
+            self[key] = value
+        return self
+
 class Widget(abc.ABC):
-    def __init__(self):
-        self.element = Element('div')
+    attrs: Attributes | None = None
+
+    def __init__(self, root_tag='div', server=None):
+        self.attrs = Attributes()
+        self.element = Element(root_tag)
         self.name = None
+        if server is not None:
+            self.server = server
+
+    def c2s(self, event_name):
+        def decorator(func):
+            if not hasattr(self.server, '_pending_c2s'):
+                self.server._pending_c2s = []
+            self.server._pending_c2s.append((event_name, func))
+            return func
+        return decorator
+
+    def s2c(self, event_name):
+        def decorator(func):
+            self.server.s2c_listeners[event_name] = func
+            return func
+        return decorator
 
     @abc.abstractmethod
     def build(self):
-        """Return the root Element of the widget"""
-        pass
+        return self.element
 
     def render(self):
         root = self.build()
@@ -34,60 +149,86 @@ class Widget(abc.ABC):
         html = root.render()
         event_js = f"""
         <script>
-        const ws = new WebSocket('ws://{self.server.host}:{self.server.port + 1}');
-        const pendingRequests = {{}};
-        let requestId = 0;
-        ws.onmessage = function(event) {{
-            const data = JSON.parse(event.data);
-            const eventName = data.event;
-            const eventData = data.data;
-            const id = data.id;
-            if (id) {{
-                const req = pendingRequests[id];
-                if (req) {{
-                    clearTimeout(req.timeout);
-                    delete pendingRequests[id];
-                    req.resolve(eventData);
-                }}
-            }} else {{
-                window.dispatchEvent(new CustomEvent(eventName, {{ detail: eventData }}));
-                // Live update handlers
-                if (eventName === 'update' && eventData.widget === 'counter') {{
-                    const counterDiv = document.getElementById('counter');
-                    if (counterDiv) {{
-                        counterDiv.textContent = `Count: ${{eventData.count}}`;
+        let ws;
+        let pingInterval;
+        let reconnectTimeout;
+
+        function connect() {{
+            ws = new WebSocket('ws://{self.server.host}:{self.server.port + 1}');
+            ws.onopen = function() {{
+                clearTimeout(reconnectTimeout);
+                pingInterval = setInterval(() => {{
+                    sendEvent('ping', {{}});
+                }}, 30000);
+            }};
+            ws.onmessage = function(event) {{
+                const data = JSON.parse(event.data);
+                const eventName = data.event;
+                const eventData = data.data;
+                const id = data.id;
+                if (id) {{
+                    const req = pendingRequests[id];
+                    if (req) {{
+                        clearTimeout(req.timeout);
+                        delete pendingRequests[id];
+                        req.resolve(eventData);
                     }}
-                }}
-                if (eventName === 'chat_message') {{
-                    const chatDiv = document.getElementById('chat-messages');
-                    if (chatDiv) {{
-                        const msgDiv = document.createElement('div');
-                        msgDiv.textContent = `${{eventData.user}}: ${{eventData.message}}`;
-                        msgDiv.style.opacity = '0';
-                        msgDiv.style.transform = 'translateY(20px)';
-                        chatDiv.appendChild(msgDiv);
-                        setTimeout(() => {{
-                            msgDiv.style.transition = 'all 0.5s';
-                            msgDiv.style.opacity = '1';
-                            msgDiv.style.transform = 'translateY(0)';
-                        }}, 10);
-                        if (chatDiv.children.length > 50) {{
-                            chatDiv.removeChild(chatDiv.firstChild);
+                }} else {{
+                    window.dispatchEvent(new CustomEvent(eventName, {{ detail: eventData }}));
+                    // Live update handlers
+                    if (eventName === 'update' && eventData.widget === 'counter') {{
+                        const counterDiv = document.getElementById('counter');
+                        if (counterDiv) {{
+                            counterDiv.textContent = `Count: ${{eventData.count}}`;
+                        }}
+                    }}
+                    if (eventName === 'chat_message') {{
+                        const chatDiv = document.getElementById('chat-messages');
+                        if (chatDiv) {{
+                            const msgDiv = document.createElement('div');
+                            msgDiv.textContent = `${{eventData.user}}: ${{eventData.message}}`;
+                            msgDiv.style.opacity = '0';
+                            msgDiv.style.transform = 'translateY(20px)';
+                            chatDiv.appendChild(msgDiv);
+                            setTimeout(() => {{
+                                msgDiv.style.transition = 'all 0.5s';
+                                msgDiv.style.opacity = '1';
+                                msgDiv.style.transform = 'translateY(0)';
+                            }}, 10);
+                            if (chatDiv.children.length > 50) {{
+                                chatDiv.removeChild(chatDiv.firstChild);
+                            }}
                         }}
                     }}
                 }}
-            }}
-        }};
+            }};
+            ws.onclose = function() {{
+                clearInterval(pingInterval);
+                reconnectTimeout = setTimeout(connect, 1000);
+            }};
+            ws.onerror = function() {{
+                ws.close();
+            }};
+        }}
+
+        connect();
+
+        const pendingRequests = {{}};
+        let requestId = 0;
         function sendEvent(eventName, data) {{
-            const id = ++requestId;
-            return new Promise((resolve, reject) => {{
-                const timeout = setTimeout(() => {{
-                    delete pendingRequests[id];
-                    reject(new Error('Request timeout'));
-                }}, 5000);
-                pendingRequests[id] = {{ resolve, reject, timeout }};
-                ws.send(JSON.stringify({{ event: eventName, data: data, id: id }}));
-            }});
+            if (ws.readyState === WebSocket.OPEN) {{
+                const id = ++requestId;
+                return new Promise((resolve, reject) => {{
+                    const timeout = setTimeout(() => {{
+                        delete pendingRequests[id];
+                        reject(new Error('Request timeout'));
+                    }}, 5000);
+                    pendingRequests[id] = {{ resolve, reject, timeout }};
+                    ws.send(JSON.stringify({{ event: eventName, data: data, id: id }}));
+                }});
+            }} else {{
+                return Promise.reject(new Error('WebSocket not connected'));
+            }}
         }}
         </script>
         <script src="https://cdn.jsdelivr.net/npm/brython@latest/brython.min.js"></script>
@@ -102,8 +243,25 @@ class Widget(abc.ABC):
         </script>
         """
         client_code = []
-        if hasattr(self, 'client_python'):
-            client_code.append(self.client_python())
+        if hasattr(self, '__class__'):
+            for name in dir(self.__class__):
+                attr = getattr(self.__class__, name)
+                if hasattr(attr, '__client_event__'):
+                    event = attr.__client_event__
+                    source = inspect.getsource(attr)
+                    lines = source.split('\n')
+
+                    def_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
+
+                    code_lines = lines[def_idx:]
+
+                    code = textwrap.dedent('\n'.join(code_lines))
+                    client_code.append(f"""
+from browser import *
+from browser import window
+{code}
+window.server.on('{event}', {attr.__name__})
+""")
         for name in dir(self):
             attr = getattr(self, name)
             if hasattr(attr, '__client_event__'):
@@ -117,8 +275,9 @@ class Widget(abc.ABC):
 
                 code = textwrap.dedent('\n'.join(code_lines))
                 client_code.append(f"""
+from browser import *
+from browser import window
 {code}
-
 window.server.on('{event}', {attr.__name__})
 """)
         if client_code:
@@ -132,83 +291,6 @@ def client(event_name):
         func.__client_event__ = event_name
         return func
     return decorator
-
-class Attributes(dict):
-    def mime(self, value):
-        self['type'] = value
-        return self
-    
-    def bg(self, value):
-        self['background'] = value
-        return self
-    
-    def fg(self, value):
-        self['color'] = value
-        return self
-    
-    def font(self, value):
-        self['font-family'] = value
-        return self
-    
-    def font_size(self, value):
-        self['font-size'] = f'{value}px'
-        return self
-    
-    def font_weight(self, value):
-        self['font-weight'] = value
-        return self
-    
-    def border(self, value):
-        self['border'] = f'{value["width"]} {value["style"]} {value["color"]}'
-        return self
-    
-    def padding(self, value):
-        self['padding'] = f'{value}px'
-        return self
-    
-    def margin(self, value):
-        self['margin'] = f'{value}px'
-        return self
-    
-    def corners(self, value):
-        self['border-radius'] = f'{value}px'
-        return self
-    
-    def shadow(self, value):
-        self['box-shadow'] = f'{value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}'
-        return self
-    
-    def flex(self, value):
-        if value == "center":
-            self['display'] = 'flex'
-            self['justify-content'] = 'center'
-            self['align-items'] = 'center'
-        else:
-            self['display'] = 'flex'
-        return self
-    
-    def fg_shadow(self, value):
-        self['text-shadow'] = f'{value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}'
-        return self
-    
-    def text(self, value):
-        self['text-align'] = value
-        return self
-    
-    def dims(self, value):
-        self['width'] = f'{value["width"]}px'
-        self['height'] = f'{value["height"]}px'
-        return self
-    
-    def pos(self, value):
-        self['position'] = 'absolute'
-        self['top'] = f'{value["top"]}px'
-        self['left'] = f'{value["left"]}px'
-        return self
-    
-    def custom(self, key, value):
-        self[key] = value
-        return self
 
 class Element:
     def __init__(self, tag, content=None, attrs=None):
@@ -260,20 +342,24 @@ td = element('td')
 a = element('a')
 
 class Server:
-    def __init__(self, host='localhost', port=8080):
+    def __init__(self, host='127.0.0.1', port=5001):
         self.host = host
         self.port = port
         self.s2c_events = {}
         self.c2s_listeners = {}
         self.c2s_events = {}
         self.s2c_listeners = {}
+        self._pending_c2s = []
         self.widgets = {}
         self.connected_clients = set()
         self.trigger_event = self.dispatch_s2c
+        self.loop = None
     
     def c2s(self, event_name):
         def decorator(func):
-            self.c2s_listeners[event_name] = func
+            if not hasattr(self, '_pending_c2s'):
+                self._pending_c2s = []
+            self._pending_c2s.append((event_name, func))
             return func
         return decorator
 
@@ -285,40 +371,62 @@ class Server:
 
     def widget(self, widget_name, root_tag='div'):
         def decorator(cls):
-            instance = cls()
-            def __init__hook(self=instance):
-                Widget.__init__(self, root_tag)
+            def __init__(self, *args, **kwargs):
+                Widget.__init__(self, root_tag, self)
                 self.initialize()
-            setattr(instance, '__init__', __init__hook)
+            cls.__init__ = __init__
+            instance = cls()
             instance.name = widget_name
             instance.server = self
             self.widgets[widget_name] = instance
+            # bind pending c2s
+            for event_name, func in getattr(self, '_pending_c2s', []):
+                bound_func = getattr(instance, func.__name__, None)
+                if bound_func:
+                    self.c2s_listeners[event_name] = bound_func
+            if hasattr(self, '_pending_c2s'):
+                self._pending_c2s.clear()
             return cls
         return decorator
     
     def builtin(self, *args):
         if len(args) == 0:
             def decorator(cls):
-                instance = cls()
+                instance = cls(self)
                 instance.register(self)
+                for event_name, func in getattr(self, '_pending_c2s', []):
+                    bound_func = getattr(instance, func.__name__, None)
+                    if bound_func:
+                        self.c2s_listeners[event_name] = bound_func
+                if hasattr(self, '_pending_c2s'):
+                    self._pending_c2s.clear()
                 return cls
             return decorator
         elif len(args) == 1:
             cls = args[0]
-            instance = cls()
+            instance = cls(self)
             instance.register(self)
+            # bind pending c2s
+            for event_name, func in getattr(self, '_pending_c2s', []):
+                bound_func = getattr(instance, func.__name__, None)
+                if bound_func:
+                    self.c2s_listeners[event_name] = bound_func
+            if hasattr(self, '_pending_c2s'):
+                self._pending_c2s.clear()
             return cls
         else:
             raise TypeError("builtin takes at most 1 argument")
     
-    async def ws_handler(self, websocket, path):
+    async def ws_handler(self, websocket):
         self.connected_clients.add(websocket)
         try:
             async for message in websocket:
                 data = json.loads(message)
                 event_name = data.get('event')
                 event_data = data.get('data', {})
-                if event_name in self.c2s_listeners:
+                if event_name == 'ping':
+                    await websocket.send(json.dumps({'event': 'pong'}))
+                elif event_name in self.c2s_listeners:
                     response = await self.c2s_listeners[event_name](event_data, websocket)
                     if response is not None:
                         response_event = {'event': f'{event_name}_response', 'data': response}
@@ -334,7 +442,10 @@ class Server:
         event = {'event': event_name, 'data': data}
         message = json.dumps(event)
         for client in self.connected_clients.copy():
-            asyncio.create_task(client.send(message))
+            if self.loop:
+                self.loop.call_soon_threadsafe(lambda c=client, m=message: asyncio.create_task(c.send(m)))
+            else:
+                asyncio.create_task(client.send(message))
     
     def dispatch_s2c(self, event_name: str, data: Dict[str, Any]) -> None:
         if event_name in self.s2c_listeners:
@@ -345,41 +456,70 @@ class Server:
     
     def dispatch_c2s(self, event_name: str, data: Dict[str, Any]) -> None:
         if event_name in self.c2s_listeners:
-            import asyncio
-            asyncio.create_task(self.c2s_listeners[event_name](data, None))
+            coro = self.c2s_listeners[event_name](data, None)
+            if self.loop:
+                self.loop.call_soon_threadsafe(lambda: asyncio.create_task(coro))
+            else:
+                asyncio.create_task(coro)
     
     def generate_event_js(self):
         js = f"""
         <script>
-        const ws = new WebSocket('ws://{self.host}:{self.port + 1}');
+        let ws;
+        let pingInterval;
+        let reconnectTimeout;
+
+        function connect() {{
+            ws = new WebSocket('ws://{self.host}:{self.port + 1}');
+            ws.onopen = function() {{
+                clearTimeout(reconnectTimeout);
+                pingInterval = setInterval(() => {{
+                    sendEvent('ping', {{}});
+                }}, 30000);
+            }};
+            ws.onmessage = function(event) {{
+                const data = JSON.parse(event.data);
+                const eventName = data.event;
+                const eventData = data.data;
+                const id = data.id;
+                if (id) {{
+                    const req = pendingRequests[id];
+                    if (req) {{
+                        clearTimeout(req.timeout);
+                        delete pendingRequests[id];
+                        req.resolve(eventData);
+                    }}
+                }} else {{
+                    window.dispatchEvent(new CustomEvent(eventName, {{ detail: eventData }}));
+                }}
+            }};
+            ws.onclose = function() {{
+                clearInterval(pingInterval);
+                reconnectTimeout = setTimeout(connect, 1000);
+            }};
+            ws.onerror = function() {{
+                ws.close();
+            }};
+        }}
+
+        connect();
+
         const pendingRequests = {{}};
         let requestId = 0;
-        ws.onmessage = function(event) {{
-            const data = JSON.parse(event.data);
-            const eventName = data.event;
-            const eventData = data.data;
-            const id = data.id;
-            if (id) {{
-                const req = pendingRequests[id];
-                if (req) {{
-                    clearTimeout(req.timeout);
-                    delete pendingRequests[id];
-                    req.resolve(eventData);
-                }}
-            }} else {{
-                window.dispatchEvent(new CustomEvent(eventName, {{ detail: eventData }}));
-            }}
-        }};
         function sendEvent(eventName, data) {{
-            const id = ++requestId;
-            return new Promise((resolve, reject) => {{
-                const timeout = setTimeout(() => {{
-                    delete pendingRequests[id];
-                    reject(new Error('Request timeout'));
-                }}, 5000);
-                pendingRequests[id] = {{ resolve, reject, timeout }};
-                ws.send(JSON.stringify({{ event: eventName, data: data, id: id }}));
-            }});
+            if (ws.readyState === WebSocket.OPEN) {{
+                const id = ++requestId;
+                return new Promise((resolve, reject) => {{
+                    const timeout = setTimeout(() => {{
+                        delete pendingRequests[id];
+                        reject(new Error('Request timeout'));
+                    }}, 5000);
+                    pendingRequests[id] = {{ resolve, reject, timeout }};
+                    ws.send(JSON.stringify({{ event: eventName, data: data, id: id }}));
+                }});
+            }} else {{
+                return Promise.reject(new Error('WebSocket not connected'));
+            }}
         }}
         </script>
         """
@@ -387,7 +527,6 @@ class Server:
     
     def run(self):
         import asyncio
-        import json
         import threading
         
         app = flask.Flask(__name__)
@@ -407,14 +546,14 @@ class Server:
             app.run(host=self.host, port=self.port, debug=False)
 
         def run_ws():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            ws_server = websockets.serve(self.ws_handler, self.host, self.port + 1)
-            loop.run_until_complete(ws_server)
-            loop.run_forever()
+            async def _run():
+                self.loop = asyncio.get_running_loop()
+                server = await websockets.serve(self.ws_handler, self.host, self.port + 1)
+                await server.serve_forever()
+            asyncio.run(_run())
 
-        threading.Thread(target=run_flask).start()
-        threading.Thread(target=run_ws).start()
+        threading.Thread(target=run_flask, daemon=True).start()
+        threading.Thread(target=run_ws, daemon=True).start()
 
 def test_attributes():
     attrs = Attributes()
@@ -424,14 +563,14 @@ def test_attributes():
     attrs.font_size(14)
     attrs.border({'width': '2px', 'style': 'solid', 'color': '#FF0000'})
     attrs.flex("center")
-    assert attrs['background'] == '#000000'
-    assert attrs['color'] == '#FFFFFF'
-    assert attrs['font-family'] == 'Arial'
-    assert attrs['font-size'] == '14px'
-    assert attrs['border'] == '2px solid #FF0000'
-    assert attrs['display'] == 'flex'
-    assert attrs['justify-content'] == 'center'
-    assert attrs['align-items'] == 'center'
+    assert 'background: #000000' in attrs['style']
+    assert 'color: #FFFFFF' in attrs['style']
+    assert 'font-family: Arial' in attrs['style']
+    assert 'font-size: 14px' in attrs['style']
+    assert 'border: 2px solid #FF0000' in attrs['style']
+    assert 'display: flex' in attrs['style']
+    assert 'justify-content: center' in attrs['style']
+    assert 'align-items: center' in attrs['style']
 
 def test_server():
     server = Server()

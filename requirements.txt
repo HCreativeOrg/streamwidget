@@ -1,0 +1,8 @@
+websockets
+dotenv
+twitchAPI
+markupsafe
+brython
+requests
+flask
+flask-cors
