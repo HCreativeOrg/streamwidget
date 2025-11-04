@@ -5,8 +5,11 @@ import asyncio
 import json
 import inspect
 import textwrap
+import threading
+import re
+import ast
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Callable, Awaitable, TypedDict
+from typing import Dict, Any, Optional, Callable, Awaitable, Union, List, Set, Tuple
 
 @dataclass
 class Event:
@@ -14,101 +17,126 @@ class Event:
     data: Dict[str, Any]
 
 class Builtin(abc.ABC):
-    def __init__(self, server):
+    def __init__(self, server: 'Server') -> None:
         self.server = server
 
-    def c2s(self, event_name):
-        def decorator(func):
+    def c2s(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             if not hasattr(self.server, '_pending_c2s'):
                 self.server._pending_c2s = []
             self.server._pending_c2s.append((event_name, func))
             return func
         return decorator
 
-    def s2c(self, event_name):
-        def decorator(func):
+    def s2c(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self.server.s2c_listeners[event_name] = func
             return func
         return decorator
 
     @abc.abstractmethod
-    def register(self, server):
+    def register(self, server: 'Server') -> None:
         pass
 
 class Attributes(dict):
-    def _add_style(self, css):
+    def _add_style(self, css: str) -> None:
         if 'style' not in self:
             self['style'] = ''
         self['style'] += css + '; '
     
-    def mime(self, value):
+    def mime(self, value: str) -> 'Attributes':
         self['type'] = value
         return self
     
-    def bg(self, value):
+    def bg(self, value: str) -> 'Attributes':
         self._add_style(f'background: {value}')
         return self
     
-    def fg(self, value):
+    def fg(self, value: str) -> 'Attributes':
         self._add_style(f'color: {value}')
         return self
     
-    def font(self, value):
+    def font(self, value: str) -> 'Attributes':
         self._add_style(f'font-family: {value}')
         return self
     
-    def font_size(self, value):
+    def font_size(self, value: int) -> 'Attributes':
         self._add_style(f'font-size: {value}px')
         return self
     
-    def font_weight(self, value):
+    def font_weight(self, value: str) -> 'Attributes':
         self._add_style(f'font-weight: {value}')
         return self
     
-    def border(self, value):
+    def border(self, value: Dict[str, str]) -> 'Attributes':
         self._add_style(f'border: {value["width"]} {value["style"]} {value["color"]}')
         return self
     
-    def padding(self, value):
+    def padding(self, value: int) -> 'Attributes':
         self._add_style(f'padding: {value}px')
         return self
     
-    def margin(self, value):
+    def margin(self, value: int) -> 'Attributes':
         self._add_style(f'margin: {value}px')
         return self
     
-    def corners(self, value):
-        self._add_style(f'border-radius: {value}px')
+    def corners(self, value: Dict[str, Any]) -> 'Attributes':
+        self._add_style('border-radius: ' + (f"{value['top'][0]} {value['top'][1]} {value['bottom'][0]} {value['bottom'][1]}" if not value.get("all") else value["all"]))
         return self
     
-    def shadow(self, value):
+    def shadow(self, value: Dict[str, Any]) -> 'Attributes':
         self._add_style(f'box-shadow: {value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}')
         return self
     
-    def flex(self, value):
+    def flex(self, value: str) -> 'Attributes':
         if value == "center":
             self._add_style('display: flex; justify-content: center; align-items: center')
         else:
             self._add_style('display: flex')
         return self
     
-    def fg_shadow(self, value):
+    def fg_shadow(self, value: Dict[str, Any]) -> 'Attributes':
         self._add_style(f'text-shadow: {value["offset"][0]} {value["offset"][1]} {value["blur"]} {value["color"]}')
         return self
     
-    def text(self, value):
+    def text(self, value: str) -> 'Attributes':
         self._add_style(f'text-align: {value}')
         return self
     
-    def dims(self, value):
+    def dims(self, value: Dict[str, int]) -> 'Attributes':
         self._add_style(f'width: {value["width"]}px; height: {value["height"]}px')
         return self
     
-    def pos(self, value):
+    def pos(self, value: Dict[str, int]) -> 'Attributes':
         self._add_style(f'position: absolute; top: {value["top"]}px; left: {value["left"]}px')
         return self
-    
-    def custom(self, key, value):
+
+    def on_click(self, event_name: str) -> 'Attributes':
+        """Register a client-side click event"""
+        self['data-on-click'] = event_name
+        return self
+
+    def on_mouseover(self, event_name: str) -> 'Attributes':
+        """Register a client-side mouseover event"""
+        self['data-on-mouseover'] = event_name
+        return self
+
+    def on_mouseout(self, event_name: str) -> 'Attributes':
+        """Register a client-side mouseout event"""
+        self['data-on-mouseout'] = event_name
+        return self
+
+    def on_dblclick(self, event_name: str) -> 'Attributes':
+        """Register a client-side double-click event"""
+        self['data-on-dblclick'] = event_name
+        return self
+
+    def on_input(self, event_name: str) -> 'Attributes':
+        """Register a client-side input event"""
+        self['data-on-input'] = event_name
+        return self
+
+    def custom(self, key: str, value: Any) -> 'Attributes':
         if key == 'style':
             self._add_style(value.rstrip(';'))
         else:
@@ -116,34 +144,32 @@ class Attributes(dict):
         return self
 
 class Widget(abc.ABC):
-    attrs: Attributes | None = None
+    attrs: Attributes = Attributes()
 
-    def __init__(self, root_tag='div', server=None):
+    def __init__(self, root_tag: str = 'div', server: Optional['Server'] = None) -> None:
         self.attrs = Attributes()
         self.element = Element(root_tag)
-        self.name = None
+        self.name: Optional[str] = None
         if server is not None:
             self.server = server
 
-    def c2s(self, event_name):
-        def decorator(func):
-            if not hasattr(self.server, '_pending_c2s'):
-                self.server._pending_c2s = []
-            self.server._pending_c2s.append((event_name, func))
+    def c2s(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            setattr(func, '__c2s_event__', event_name)
             return func
         return decorator
 
-    def s2c(self, event_name):
-        def decorator(func):
+    def s2c(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self.server.s2c_listeners[event_name] = func
             return func
         return decorator
 
     @abc.abstractmethod
-    def build(self):
+    def build(self) -> 'Element':
         return self.element
 
-    def render(self):
+    def render(self) -> str:
         root = self.build()
         root.attrs.custom('id', self.name)
         html = root.render()
@@ -152,14 +178,21 @@ class Widget(abc.ABC):
         let ws;
         let pingInterval;
         let reconnectTimeout;
+        let wsListeners = [];
+
+        window.on_ws_open = function(listener) {{
+            wsListeners.push(listener);
+        }};
 
         function connect() {{
-            ws = new WebSocket('ws://{self.server.host}:{self.server.port + 1}');
+            ws = new WebSocket('ws://{self.server.client_host}:{self.server.ws_port}');
             ws.onopen = function() {{
                 clearTimeout(reconnectTimeout);
                 pingInterval = setInterval(() => {{
                     sendEvent('ping', {{}});
                 }}, 30000);
+
+                wsListeners.forEach(listener => listener());
             }};
             ws.onmessage = function(event) {{
                 const data = JSON.parse(event.data);
@@ -175,31 +208,6 @@ class Widget(abc.ABC):
                     }}
                 }} else {{
                     window.dispatchEvent(new CustomEvent(eventName, {{ detail: eventData }}));
-                    // Live update handlers
-                    if (eventName === 'update' && eventData.widget === 'counter') {{
-                        const counterDiv = document.getElementById('counter');
-                        if (counterDiv) {{
-                            counterDiv.textContent = `Count: ${{eventData.count}}`;
-                        }}
-                    }}
-                    if (eventName === 'chat_message') {{
-                        const chatDiv = document.getElementById('chat-messages');
-                        if (chatDiv) {{
-                            const msgDiv = document.createElement('div');
-                            msgDiv.textContent = `${{eventData.user}}: ${{eventData.message}}`;
-                            msgDiv.style.opacity = '0';
-                            msgDiv.style.transform = 'translateY(20px)';
-                            chatDiv.appendChild(msgDiv);
-                            setTimeout(() => {{
-                                msgDiv.style.transition = 'all 0.5s';
-                                msgDiv.style.opacity = '1';
-                                msgDiv.style.transform = 'translateY(0)';
-                            }}, 10);
-                            if (chatDiv.children.length > 50) {{
-                                chatDiv.removeChild(chatDiv.firstChild);
-                            }}
-                        }}
-                    }}
                 }}
             }};
             ws.onclose = function() {{
@@ -238,45 +246,136 @@ class Widget(abc.ABC):
             send: sendEvent,
             on: function(event, callback) {{
                 window.addEventListener(event, (e) => callback(e.detail));
+            }},
+            emit: function(event, data) {{
+                return sendEvent(event, data || {{}});
+            }},
+            listeners: {{}},
+            widget: {{
+                onElementEvent: function(elemId, eventType, handler) {{
+                    const elem = document.getElementById(elemId);
+                    if (elem) {{
+                        const eventMap = {{
+                            'click': 'data-on-click',
+                            'mouseover': 'data-on-mouseover',
+                            'mouseout': 'data-on-mouseout',
+                            'dblclick': 'data-on-dblclick',
+                            'input': 'data-on-input'
+                        }};
+                        const attrName = eventMap[eventType];
+                        if (attrName) {{
+                            elem.addEventListener(eventType, async (e) => {{
+                                const eventName = elem.getAttribute(attrName);
+                                if (eventName) {{
+                                    try {{
+                                        const response = await sendEvent(eventName, {{
+                                            elementId: elemId,
+                                            value: e.target.value || null,
+                                            type: eventType,
+                                            clientX: e.clientX,
+                                            clientY: e.clientY
+                                        }});
+                                        if (handler) {{
+                                            handler(response);
+                                        }}
+                                    }} catch (err) {{
+                                        console.error('Event handler error:', err);
+                                    }}
+                                }}
+                            }});
+                        }}
+                    }}
+                }},
+                attachHandlers: function(widgetId) {{
+                    const widget = document.getElementById(widgetId);
+                    if (widget) {{
+                        const eventTypes = ['click', 'mouseover', 'mouseout', 'dblclick', 'input'];
+                        const elements = [widget, ...widget.querySelectorAll('[data-on-click], [data-on-mouseover], [data-on-mouseout], [data-on-dblclick], [data-on-input]')];
+                        elements.forEach(elem => {{
+                            eventTypes.forEach(eventType => {{
+                                if (elem.hasAttribute('data-on-' + eventType)) {{
+                                    elem.addEventListener(eventType, async (e) => {{
+                                        const eventName = elem.getAttribute('data-on-' + eventType);
+                                        try {{
+                                            const response = await sendEvent(eventName, {{
+                                                elementId: elem.id || widgetId,
+                                                value: e.target.value || null,
+                                                type: eventType,
+                                                clientX: e.clientX,
+                                                clientY: e.clientY
+                                            }});
+                                            window.dispatchEvent(new CustomEvent(eventName + '_response', {{ detail: response }}));
+                                        }} catch (err) {{
+                                            console.error('Event error:', err);
+                                        }}
+                                    }});
+                                }}
+                            }});
+                        }});
+                    }}
+                }}
             }}
         }};
+        window.server.widget.attachHandlers('{self.name}');
+        const observer = new MutationObserver((mutations) => {{
+            mutations.forEach((mutation) => {{
+                mutation.addedNodes.forEach((node) => {{
+                    if (node.nodeType === Node.ELEMENT_NODE) {{
+                        const elements = [node, ...node.querySelectorAll('[data-on-click], [data-on-mouseover], [data-on-mouseout], [data-on-dblclick], [data-on-input]')];
+                        elements.forEach(elem => {{
+                            if (elem.hasAttribute && (elem.hasAttribute('data-on-click') || elem.hasAttribute('data-on-mouseover') || elem.hasAttribute('data-on-mouseout') || elem.hasAttribute('data-on-dblclick') || elem.hasAttribute('data-on-input'))) {{
+                                const eventTypes = ['click', 'mouseover', 'mouseout', 'dblclick', 'input'];
+                                eventTypes.forEach(eventType => {{
+                                    if (elem.hasAttribute('data-on-' + eventType)) {{
+                                        elem.addEventListener(eventType, async (e) => {{
+                                            const eventName = elem.getAttribute('data-on-' + eventType);
+                                            try {{
+                                                const response = await sendEvent(eventName, {{
+                                                    elementId: elem.id || '{self.name}',
+                                                    value: e.target.value || null,
+                                                    type: eventType,
+                                                    clientX: e.clientX,
+                                                    clientY: e.clientY
+                                                }});
+                                                window.dispatchEvent(new CustomEvent(eventName + '_response', {{ detail: response }}));
+                                            }} catch (err) {{
+                                                console.error('Event error:', err);
+                                            }}
+                                        }});
+                                    }}
+                                }});
+                            }}
+                        }});
+                    }}
+                }});
+            }});
+        }});
+        observer.observe(document.body, {{ childList: true, subtree: true }});
         </script>
         """
         client_code = []
-        if hasattr(self, '__class__'):
-            for name in dir(self.__class__):
-                attr = getattr(self.__class__, name)
-                if hasattr(attr, '__client_event__'):
-                    event = attr.__client_event__
-                    source = inspect.getsource(attr)
-                    lines = source.split('\n')
-
-                    def_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
-
-                    code_lines = lines[def_idx:]
-
-                    code = textwrap.dedent('\n'.join(code_lines))
-                    client_code.append(f"""
-from browser import *
-from browser import window
-{code}
-window.server.on('{event}', {attr.__name__})
-""")
         for name in dir(self):
             attr = getattr(self, name)
             if hasattr(attr, '__client_event__'):
                 event = attr.__client_event__
                 source = inspect.getsource(attr)
                 lines = source.split('\n')
-
                 def_idx = next((i for i, line in enumerate(lines) if line.strip().startswith('def ')), 0)
-
-                code_lines = lines[def_idx:]
-
-                code = textwrap.dedent('\n'.join(code_lines))
+                func_source = textwrap.dedent('\n'.join(lines[def_idx:]))
+                func = ast.parse(func_source)
+                func_def = func.body[0]
+                if isinstance(func_def, ast.FunctionDef):
+                    func_def.args.args = [arg for arg in func_def.args.args if arg.arg not in ('self', 'browser', 'document', 'window')]
+                    func_def.body.insert(0, ast.parse("data = dict(data)").body[0])
+                code = ast.unparse(func)
                 client_code.append(f"""
+import browser
 from browser import *
 from browser import window
+
+async def send_event(event_name, data):
+    return await window.server.send(event_name, data)
+
 {code}
 window.server.on('{event}', {attr.__name__})
 """)
@@ -286,30 +385,57 @@ window.server.on('{event}', {attr.__name__})
             python_script = ''
         return html + event_js + python_script
 
-def client(event_name):
-    def decorator(func):
-        func.__client_event__ = event_name
+def client(event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, '__client_event__', event_name)
+        return func
+    return decorator
+
+def c2s(event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(func, '__c2s_event__', event_name)
         return func
     return decorator
 
 class Element:
-    def __init__(self, tag, content=None, attrs=None):
+    def __init__(self, tag: str, content: Optional[Union[str, List[Union[str, 'Element']]]] = None, attrs: Optional[Attributes] = None) -> None:
         self.tag = tag
         self.content = content or []
+        if attrs is not None and not isinstance(attrs, dict):
+            if isinstance(self.content, list):
+                self.content.append(attrs)
+            else:
+                self.content = [self.content, attrs]
+            attrs = None
         self.attrs = attrs or Attributes()
     
-    def render(self):
+    def render(self) -> str:
         if isinstance(self.content, str):
             inner = self.content
         elif isinstance(self.content, list):
-            inner = ''.join([c.render() if hasattr(c, 'render') else str(c) for c in self.content])
+            inner = ''.join(c.render() if isinstance(c, Element) else str(c) for c in self.content)
         else:
             inner = str(self.content)
-        attr_str = ' '.join([f'{key}="{value}"' for key, value in self.attrs.items()])
+        attr_str = ' '.join(f'{key}="{value}"' for key, value in self.attrs.items())
         return f'<{self.tag} {attr_str}>{inner}</{self.tag}>'
 
 def element(tag: str) -> Callable[..., Element]:
-    def element_function(content=None, attrs=None) -> Element:
+    def element_function(*args, **kwargs) -> Element:
+        content = None
+        attrs = None
+        if args:
+            if len(args) == 1:
+                if isinstance(args[0], Attributes):
+                    attrs = args[0]
+                else:
+                    content = args[0]
+            elif len(args) == 2:
+                content = args[0]
+                attrs = args[1]
+            else:
+                content = list(args)
+        if 'attrs' in kwargs:
+            attrs = kwargs['attrs']
         return Element(tag, content, attrs)
     return element_function
 
@@ -339,39 +465,70 @@ thead = element('thead')
 tbody = element('tbody')
 tr = element('tr')
 td = element('td')
+th = element('th')
+select = element('select')
+option = element('option')
 a = element('a')
+def python(script: str) -> Element:
+    return Element('script', script, Attributes().custom('type', 'text/python'))
 
 class Server:
-    def __init__(self, host='127.0.0.1', port=5001):
+    def __init__(self, host: str = '127.0.0.1', port: int = 5001) -> None:
         self.host = host
         self.port = port
-        self.s2c_events = {}
-        self.c2s_listeners = {}
-        self.c2s_events = {}
-        self.s2c_listeners = {}
-        self._pending_c2s = []
-        self.widgets = {}
-        self.connected_clients = set()
-        self.trigger_event = self.dispatch_s2c
-        self.loop = None
+        self.ws_port = port + 1
+        self.client_host = '127.0.0.1'
+        self.s2c_events: Dict[str, Any] = {}
+        self.c2s_listeners: Dict[str, Callable[..., Awaitable[Any]]] = {}
+        self.c2s_events: Dict[str, Any] = {}
+        self.s2c_listeners: Dict[str, Callable[..., Any]] = {}
+        self._pending_c2s: List[Any] = []
+        self.widgets: Dict[str, Widget] = {}
+        self.connected_clients: Set[Any] = set()
+        self.trigger_event = self.to_client
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.event_handlers: Dict[str, List[Callable[..., Any]]] = {}  # { event_name: [handler1, handler2, ...] }
+        self._s2c_queue: List[Tuple[str, Dict[str, Any]]] = []
+        self.recent_events: List[Tuple[str, Dict[str, Any]]] = []
     
-    def c2s(self, event_name):
-        def decorator(func):
+    def on(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Decorator to register a server event handler"""
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            if event_name not in self.event_handlers:
+                self.event_handlers[event_name] = []
+            self.event_handlers[event_name].append(func)
+            return func
+        return decorator
+    
+    def emit(self, event_name: str, *args: Any, **kwargs: Any) -> None:
+        """Emit a server event to all registered handlers"""
+        if event_name in self.event_handlers:
+            for handler in self.event_handlers[event_name]:
+                if asyncio.iscoroutinefunction(handler):
+                    if self.loop:
+                        asyncio.run_coroutine_threadsafe(handler(*args, **kwargs), self.loop)
+                    else:
+                        asyncio.create_task(handler(*args, **kwargs))
+                else:
+                    handler(*args, **kwargs)
+    
+    def c2s(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             if not hasattr(self, '_pending_c2s'):
                 self._pending_c2s = []
             self._pending_c2s.append((event_name, func))
             return func
         return decorator
 
-    def s2c(self, event_name):
-        def decorator(func):
+    def s2c(self, event_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self.s2c_listeners[event_name] = func
             return func
         return decorator
 
-    def widget(self, widget_name, root_tag='div'):
-        def decorator(cls):
-            def __init__(self, *args, **kwargs):
+    def widget(self, widget_name: str, root_tag: str = 'div') -> Callable[[type], type]:
+        def decorator(cls: type) -> type:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
                 Widget.__init__(self, root_tag, self)
                 self.initialize()
             cls.__init__ = __init__
@@ -379,13 +536,13 @@ class Server:
             instance.name = widget_name
             instance.server = self
             self.widgets[widget_name] = instance
-            # bind pending c2s
-            for event_name, func in getattr(self, '_pending_c2s', []):
-                bound_func = getattr(instance, func.__name__, None)
-                if bound_func:
-                    self.c2s_listeners[event_name] = bound_func
-            if hasattr(self, '_pending_c2s'):
-                self._pending_c2s.clear()
+            # Bind c2s events
+            for name in dir(instance.__class__):
+                attr = getattr(instance.__class__, name)
+                if hasattr(attr, '__c2s_event__'):
+                    event_name = attr.__c2s_event__
+                    bound_method = attr.__get__(instance, instance.__class__)
+                    self.c2s_listeners[event_name] = bound_method
             return cls
         return decorator
     
@@ -406,7 +563,7 @@ class Server:
             cls = args[0]
             instance = cls(self)
             instance.register(self)
-            # bind pending c2s
+            # Bind pending c2s
             for event_name, func in getattr(self, '_pending_c2s', []):
                 bound_func = getattr(instance, func.__name__, None)
                 if bound_func:
@@ -417,15 +574,25 @@ class Server:
         else:
             raise TypeError("builtin takes at most 1 argument")
     
-    async def ws_handler(self, websocket):
+    async def ws_handler(self, websocket: Any) -> None:
+        print(f"WebSocket client connected: {websocket}")
         self.connected_clients.add(websocket)
+        # Send recent events to the new client
+        for event_name, data in self.recent_events:
+            event = {'event': event_name, 'data': data}
+            message = json.dumps(event)
+            await websocket.send(message)
         try:
             async for message in websocket:
                 data = json.loads(message)
                 event_name = data.get('event')
                 event_data = data.get('data', {})
                 if event_name == 'ping':
-                    await websocket.send(json.dumps({'event': 'pong'}))
+                    response = {}
+                    response_event = {'event': f'{event_name}_response', 'data': response}
+                    if 'id' in data:
+                        response_event['id'] = data['id']
+                    await websocket.send(json.dumps(response_event))
                 elif event_name in self.c2s_listeners:
                     response = await self.c2s_listeners[event_name](event_data, websocket)
                     if response is not None:
@@ -438,29 +605,29 @@ class Server:
         finally:
             self.connected_clients.remove(websocket)
     
-    def send_event(self, event_name: str, data: Dict[str, Any]) -> None:
+    async def send_event(self, event_name: str, data: Dict[str, Any]) -> None:
         event = {'event': event_name, 'data': data}
         message = json.dumps(event)
         for client in self.connected_clients.copy():
-            if self.loop:
-                self.loop.call_soon_threadsafe(lambda c=client, m=message: asyncio.create_task(c.send(m)))
-            else:
-                asyncio.create_task(client.send(message))
-    
-    def dispatch_s2c(self, event_name: str, data: Dict[str, Any]) -> None:
-        if event_name in self.s2c_listeners:
-            result = self.s2c_listeners[event_name](data)
-            if result is not None:
-                data = result
-        self.send_event(event_name, data)
-    
-    def dispatch_c2s(self, event_name: str, data: Dict[str, Any]) -> None:
+            asyncio.create_task(client.send(message))
+
+    def to_client(self, event_name: str, data: Dict[str, Any], recent: bool = True) -> None:
+        if recent:
+            self.recent_events.append((event_name, data))
+            if len(self.recent_events) > 100:
+                self.recent_events.pop(0)
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(self.send_event(event_name, data), self.loop)
+        else:
+            asyncio.create_task(self.send_event(event_name, data))
+
+    def to_server(self, event_name: str, data: Dict[str, Any]) -> None:
         if event_name in self.c2s_listeners:
             coro = self.c2s_listeners[event_name](data, None)
             if self.loop:
-                self.loop.call_soon_threadsafe(lambda: asyncio.create_task(coro))
+                asyncio.run_coroutine_threadsafe(coro, self.loop)  # type: ignore
             else:
-                asyncio.create_task(coro)
+                asyncio.create_task(coro)  # type: ignore
     
     def generate_event_js(self):
         js = f"""
@@ -470,14 +637,17 @@ class Server:
         let reconnectTimeout;
 
         function connect() {{
-            ws = new WebSocket('ws://{self.host}:{self.port + 1}');
+            console.log('WebSocket connecting to ws://{self.client_host}:{self.ws_port}');
+            ws = new WebSocket('ws://{self.client_host}:{self.ws_port}');
             ws.onopen = function() {{
+                console.log('WebSocket connected');
                 clearTimeout(reconnectTimeout);
                 pingInterval = setInterval(() => {{
                     sendEvent('ping', {{}});
                 }}, 30000);
             }};
             ws.onmessage = function(event) {{
+                console.log('WebSocket message received:', event.data);
                 const data = JSON.parse(event.data);
                 const eventName = data.event;
                 const eventData = data.data;
@@ -494,10 +664,12 @@ class Server:
                 }}
             }};
             ws.onclose = function() {{
+                console.log('WebSocket closed');
                 clearInterval(pingInterval);
                 reconnectTimeout = setTimeout(connect, 1000);
             }};
-            ws.onerror = function() {{
+            ws.onerror = function(error) {{
+                console.error('WebSocket error:', error);
                 ws.close();
             }};
         }}
@@ -525,35 +697,42 @@ class Server:
         """
         return js
     
-    def run(self):
+    async def run(self):
         import asyncio
-        import threading
         
         app = flask.Flask(__name__)
 
         @app.route('/widget/<widget_name>')
-        def widget_route(widget_name):
+        def widget_route(widget_name: str) -> Union[str, Tuple[str, int]]:
             widget = self.widgets.get(widget_name)
             if widget:
                 return widget.render()
             return "Widget not found", 404
 
         @app.route('/events')
-        def events_page():
+        def events_page() -> str:
             return self.generate_event_js()
 
-        def run_flask():
-            app.run(host=self.host, port=self.port, debug=False)
+        def run_flask() -> None:
+            print(f"Starting Flask server on {self.host}:{self.port}")
+            app.run(host=self.host, port=self.port, debug=False, threaded=True)
 
-        def run_ws():
-            async def _run():
-                self.loop = asyncio.get_running_loop()
-                server = await websockets.serve(self.ws_handler, self.host, self.port + 1)
-                await server.serve_forever()
-            asyncio.run(_run())
+        async def run_ws() -> None:
+            self.loop = asyncio.get_running_loop()
+            for event_name, data in self._s2c_queue:
+                self.to_client(event_name, data)
+            self._s2c_queue.clear()
+            print(f"Starting WebSocket server on {self.host}:{self.ws_port}")
+            server = await websockets.serve(self.ws_handler, self.host, self.ws_port)
+            await server.serve_forever()
 
         threading.Thread(target=run_flask, daemon=True).start()
-        threading.Thread(target=run_ws, daemon=True).start()
+
+        await run_ws()
+
+    @staticmethod
+    def thread_wait() -> None:
+        asyncio.run(asyncio.sleep(float('inf')))
 
 def test_attributes():
     attrs = Attributes()

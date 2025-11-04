@@ -1,3 +1,3 @@
-# crit_streamwidget
+# hcreative_streamwidget
 
-Basic stream widget API.
+Memory-hooking enabled stream overlay API via fluent Python and seamless client-server integration.
